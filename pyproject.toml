@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blackbox-bill"
+version = "0.1.0"
+description = "Explain where your AI-coding-tool money went: Cursor billing black-box explainer"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "hao li" }]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+blackbox-bill = "blackbox_bill.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
