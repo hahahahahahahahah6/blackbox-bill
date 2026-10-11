@@ -16,6 +16,8 @@ from .attribution import (agent_report_text, by_agent, by_project,
 from .cursor_csv import parse_csv
 from .explain import (daily_summary, join_summary_text, pool_summary,
                       run_all_rules)
+from .headroom import (compute_headroom, dispatch_text, headroom_text,
+                       load_limits, partition_rows, simulate_dispatch)
 from .join import join_rows
 from .logs import read_all_logs, read_claude_logs
 from .tokenizer import dual_line, resolve as resolve_tokenizer
@@ -71,7 +73,8 @@ def build_parser():
     p.add_argument("--version", action="version", version="blackbox-bill " + __version__)
 
     sub = p.add_subparsers(dest="command", metavar="command",
-                           help="report: attribution from local logs")
+                           help="report: attribution from local logs; "
+                                "headroom: pre-dispatch quota dashboard")
     r = sub.add_parser("report",
                        help="cost attribution from local Claude Code logs "
                             "(no bill CSV needed)")
@@ -91,6 +94,32 @@ def build_parser():
                    help="JSON rate card for cost estimates (illustrative built-in "
                         "otherwise)")
     _add_tokenizer_args(r)
+
+    h = sub.add_parser("headroom",
+                       help="pre-dispatch per-account quota headroom "
+                            "dashboard (v0.3)")
+    h.add_argument("--csv", default=None,
+                   help="path to Cursor billing export CSV (usage so far "
+                        "this period; optional)")
+    h.add_argument("--limits-file", required=True,
+                   help="JSON file with per-account quota limits "
+                        "(see headroom.py for the format)")
+    h.add_argument("--task-in", type=float, default=None,
+                   metavar="TOKENS",
+                   help="planned task input tokens (dispatch simulator)")
+    h.add_argument("--task-out", type=float, default=None,
+                   metavar="TOKENS",
+                   help="planned task output tokens (dispatch simulator)")
+    h.add_argument("--task-pool", default="other-models",
+                   help="pool the planned task would land in "
+                        "(default other-models)")
+    h.add_argument("--rates-file", default=None,
+                   help="JSON rate card overriding account plan rates "
+                        "in the dispatch simulator")
+    h.add_argument("--since", default=None, help="only rows on/after YYYY-MM-DD")
+    h.add_argument("--until", default=None, help="only rows on/before YYYY-MM-DD")
+    h.add_argument("--markdown", default=None,
+                   help="also write a Markdown report to this path")
     return p
 
 
@@ -259,6 +288,61 @@ def render_report(args, since, until):
     return 0, "\n".join(L)
 
 
+def render_headroom(args, since, until):
+    """Per-account headroom dashboard, optionally with a dispatch sim."""
+    try:
+        accounts = load_limits(args.limits_file)
+    except ValueError as exc:
+        print("error: --limits-file: %s" % exc, file=sys.stderr)
+        return 2, None
+
+    rows, warnings = [], []
+    if args.csv:
+        rows, warnings = parse_csv(args.csv)
+        if not rows and any("cannot open" in w or "empty" in w
+                            for w in warnings):
+            for w in warnings:
+                print("error: " + w, file=sys.stderr)
+            return 2, None
+        rows = filter_dates(rows, since, until)
+
+    try:
+        rows_by_account, unclaimed = partition_rows(rows, accounts)
+    except ValueError as exc:
+        print("error: --limits-file: %s" % exc, file=sys.stderr)
+        return 2, None
+
+    result = compute_headroom(rows_by_account, accounts)
+    if unclaimed:
+        result["warnings"].append(
+            "%d row(s) matched no account and there is no default "
+            "account — add a 'match' spec or a default account" % len(unclaimed))
+
+    L = ["blackbox-bill v%s — dispatch pre-flight headroom" % __version__,
+         "=" * 60]
+    for w in warnings:
+        L.append("warning: " + w)
+    if warnings:
+        L.append("")
+    L.append(headroom_text(result, had_usage=bool(args.csv)))
+
+    if args.task_in is not None or args.task_out is not None:
+        task_in = args.task_in or 0
+        task_out = args.task_out or 0
+        sim = simulate_dispatch(result, accounts, task_in, task_out,
+                                pool=args.task_pool,
+                                rates_file=args.rates_file)
+        L.append(dispatch_text(sim))
+        L.append("")
+
+    L.append("---")
+    L.append("Headroom = your declared quota limits minus observed usage. "
+             "Limits are your own numbers (exports carry none); rate cards "
+             "are illustrative unless overridden with --rates-file. See "
+             "README limitations.")
+    return 0, "\n".join(L)
+
+
 def _write_markdown(path, text):
     try:
         with open(path, "w", encoding="utf-8") as fh:
@@ -282,6 +366,15 @@ def main(argv=None):
 
     if args.command == "report":
         code, text = render_report(args, since, until)
+        if code != 0 or text is None:
+            return code
+        print(text)
+        if args.markdown:
+            return _write_markdown(args.markdown, text)
+        return 0
+
+    if args.command == "headroom":
+        code, text = render_headroom(args, since, until)
         if code != 0 or text is None:
             return code
         print(text)

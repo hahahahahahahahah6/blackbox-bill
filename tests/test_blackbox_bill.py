@@ -81,6 +81,36 @@ CSV_MIDDAY = """date,model,pool,cost,requests
 2026-09-29 11:00:00,grok-4,Other Models,9.00,25
 """
 
+CSV_HEADROOM = """date,model,pool,cost,requests
+2026-10-01 10:00:00,grok-4,Other Models,100.00,50
+2026-10-02 10:00:00,grok-4,Other Models,20.00,10
+2026-10-01 11:00:00,claude-opus-5.5,Cursor Models,30.00,15
+"""
+
+CSV_MULTI_ACCT = """date,model,pool,account,cost,requests
+2026-10-01 10:00:00,grok-4,Other Models,acct-a,60.00,20
+2026-10-01 11:00:00,grok-4,Other Models,acct-b,10.00,5
+"""
+
+LIMITS_ONE = {
+    "accounts": [
+        {"name": "solo", "plan": "cursor:pro",
+         "limits": {"cursor-models": 500.0, "other-models": 125.0,
+                    "api-key": None}},
+    ]
+}
+
+LIMITS_MULTI = {
+    "accounts": [
+        {"name": "acct-a", "plan": "cursor:pro",
+         "limits": {"other-models": 50.0},
+         "match": {"column": "account", "value": "acct-a"}},
+        {"name": "acct-b", "plan": "cursor:pro",
+         "limits": {"other-models": 50.0},
+         "match": {"column": "account", "value": "acct-b"}},
+    ]
+}
+
 
 def make_claude_log(projects_dir, session_id, model, ts_iso,
                     in_tok=1000, out_tok=500):
@@ -98,7 +128,8 @@ def make_claude_log(projects_dir, session_id, model, ts_iso,
 
 def main():
     sys.path.insert(0, SRC)
-    from blackbox_bill import cursor_csv, explain, join as joinmod, logs, whatif
+    from blackbox_bill import (cursor_csv, explain, headroom, join as joinmod,
+                               logs, whatif)
 
     # --- CSV parsing ---
     with tempfile.TemporaryDirectory() as tmp:
@@ -388,6 +419,170 @@ def main():
               code == 0 and "no matching local session" in out
               and "Local-log join" in out,
               "rc=%d" % code)
+
+    # --- v0.3 headroom dashboard ---
+    with tempfile.TemporaryDirectory() as tmp:
+        lp = os.path.join(tmp, "limits.json")
+        write(lp, json.dumps(LIMITS_ONE))
+        accounts = headroom.load_limits(lp)
+        check("limits file loads one account", len(accounts) == 1
+              and accounts[0]["name"] == "solo")
+        check("non-canonical pool labels normalized to canonical",
+              "cursor-models" in accounts[0]["limits"]
+              and "other-models" in accounts[0]["limits"])
+
+        # malformed inputs rejected, not crash
+        bad = os.path.join(tmp, "bad.json")
+        write(bad, "{not json")
+        try:
+            headroom.load_limits(bad)
+            check("malformed limits JSON raises ValueError", False)
+        except ValueError:
+            check("malformed limits JSON raises ValueError", True)
+        write(bad, json.dumps({"accounts": []}))
+        try:
+            headroom.load_limits(bad)
+            check("empty accounts list raises ValueError", False)
+        except ValueError:
+            check("empty accounts list raises ValueError", True)
+        try:
+            headroom.load_limits(os.path.join(tmp, "missing.json"))
+            check("missing limits file raises ValueError", False)
+        except ValueError:
+            check("missing limits file raises ValueError", True)
+
+        # headroom without a CSV: limits only, no usage
+        rows_by_acct, unclaimed = headroom.partition_rows([], accounts)
+        check("no rows -> no unclaimed", unclaimed == []
+              and rows_by_acct == {"solo": []})
+        res = headroom.compute_headroom(rows_by_acct, accounts)
+        solo = res["accounts"][0]["pools"]
+        check("no usage -> OK, full headroom",
+              solo["other-models"]["status"] == "OK"
+              and solo["other-models"]["remaining"] == 125.0)
+        check("null limit -> UNLIMITED",
+              solo["api-key"]["status"] == "UNLIMITED"
+              and solo["api-key"]["remaining"] is None)
+        txt = headroom.headroom_text(res, had_usage=False)
+        check("limits-only dashboard says no CSV was given",
+              "no --csv given" in txt and "unlimited" in txt)
+
+        # with usage: LOW at <25% remaining, EXHAUSTED over the cap
+        p = os.path.join(tmp, "usage.csv")
+        write(p, CSV_HEADROOM)
+        rows, _ = cursor_csv.parse_csv(p)
+        rows_by_acct, unclaimed = headroom.partition_rows(rows, accounts)
+        res = headroom.compute_headroom(rows_by_acct, accounts)
+        om = res["accounts"][0]["pools"]["other-models"]
+        check("120/125 consumed -> LOW, remaining 5.00",
+              om["status"] == "LOW" and abs(om["remaining"] - 5.0) < 1e-9
+              and om["consumed"] == 120.0,
+              repr(om))
+        check("cursor-models 30/500 -> OK",
+              res["accounts"][0]["pools"]["cursor-models"]["status"] == "OK")
+
+        # over-limit -> EXHAUSTED
+        lp2 = os.path.join(tmp, "limits2.json")
+        write(lp2, json.dumps({"accounts": [
+            {"name": "tight", "plan": "cursor:pro",
+             "limits": {"other-models": 100.0}}]}))
+        accounts2 = headroom.load_limits(lp2)
+        rows_by_acct2, _ = headroom.partition_rows(rows, accounts2)
+        om2 = headroom.compute_headroom(rows_by_acct2, accounts2
+                                        )["accounts"][0]["pools"]["other-models"]
+        check("120/100 consumed -> EXHAUSTED, negative remaining",
+              om2["status"] == "EXHAUSTED" and om2["remaining"] < 0)
+
+        # multi-account partition by column
+        lpm = os.path.join(tmp, "limits-multi.json")
+        write(lpm, json.dumps(LIMITS_MULTI))
+        maccounts = headroom.load_limits(lpm)
+        pm = os.path.join(tmp, "multi.csv")
+        write(pm, CSV_MULTI_ACCT)
+        mrows, _ = cursor_csv.parse_csv(pm)
+        mby, unclaimed = headroom.partition_rows(mrows, maccounts)
+        check("rows partitioned by account column, none unclaimed",
+              len(mby["acct-a"]) == 1 and len(mby["acct-b"]) == 1
+              and not unclaimed)
+        mres = headroom.compute_headroom(mby, maccounts)
+        ma = {a["name"]: a for a in mres["accounts"]}
+        check("acct-a 60/50 -> EXHAUSTED",
+              ma["acct-a"]["pools"]["other-models"]["status"] == "EXHAUSTED")
+        check("acct-b 10/50 -> OK",
+              ma["acct-b"]["pools"]["other-models"]["status"] == "OK")
+
+        # overlapping match specs rejected
+        lpo = os.path.join(tmp, "limits-overlap.json")
+        write(lpo, json.dumps({"accounts": [
+            {"name": "x", "limits": {"other-models": 10.0},
+             "match": {"column": "account", "value": "acct-a"}},
+            {"name": "y", "limits": {"other-models": 10.0},
+             "match": {"column": "account", "value": "acct-a"}},
+        ]}))
+        oaccounts = headroom.load_limits(lpo)
+        try:
+            headroom.partition_rows(mrows, oaccounts)
+            check("overlapping match specs raise ValueError", False)
+        except ValueError:
+            check("overlapping match specs raise ValueError", True)
+
+        # dispatch simulator: which account can absorb the task?
+        # cursor:pro other-models = $5/M in + $20/M out:
+        # 1M in + 250K out = $10. acct-a remaining -10 -> no; acct-b 40 -> yes.
+        sim = headroom.simulate_dispatch(
+            mres, maccounts, 1_000_000, 250_000, pool="other-models")
+        by_name = {e["account"]: e for e in sim["estimates"]}
+        check("task priced at $10 under cursor:pro other-models",
+              by_name["acct-b"]["cost"] is not None
+              and abs(by_name["acct-b"]["cost"] - 10.0) < 1e-9,
+              repr(by_name["acct-b"]["cost"]))
+        check("acct-b fits the task", by_name["acct-b"]["fits"] is True)
+        check("acct-a does not fit the task", by_name["acct-a"]["fits"] is False)
+        check("recommendation is acct-b",
+              sim["recommendation"] == "acct-b")
+        dtxt = headroom.dispatch_text(sim)
+        check("dispatch text names the recommendation",
+              "RECOMMEND" in dtxt and "acct-b" in dtxt)
+
+        # impossible task -> no recommendation, honest warning
+        sim2 = headroom.simulate_dispatch(
+            mres, maccounts, 100_000_000, 100_000_000, pool="other-models")
+        check("no account fits -> recommendation None + WARNING",
+              sim2["recommendation"] is None
+              and "WARNING" in headroom.dispatch_text(sim2))
+
+    # --- headroom CLI end to end ---
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "usage.csv")
+        write(p, CSV_HEADROOM)
+        lp = os.path.join(tmp, "limits.json")
+        write(lp, json.dumps(LIMITS_ONE))
+        code, out, err = run_cli(
+            ["headroom", "--csv", p, "--limits-file", lp,
+             "--task-in", "1000000", "--task-out", "250000"], cwd=tmp)
+        check("headroom CLI exit 0 with csv + limits + task",
+              code == 0, "rc=%d err=%s" % (code, err[:200]))
+        check("headroom CLI prints pre-flight dashboard",
+              "pre-flight" in out and "solo" in out and "LOW" in out,
+              out[:200])
+        check("headroom CLI prints dispatch recommendation",
+              "RECOMMEND" in out or "Dispatch simulation" in out)
+        md = os.path.join(tmp, "headroom.md")
+        code, out, err = run_cli(
+            ["headroom", "--limits-file", lp, "--markdown", md], cwd=tmp)
+        md_ok = (code == 0 and os.path.exists(md)
+                 and "pre-flight" in open(md).read().lower())
+        check("headroom CLI works limits-only and writes markdown",
+              md_ok, "rc=%d" % code)
+        code, out, err = run_cli(["headroom", "--csv", p], cwd=tmp)
+        check("headroom CLI exit 2 without --limits-file", code == 2,
+              "rc=%d" % code)
+        bad = os.path.join(tmp, "bad.json")
+        write(bad, "nope")
+        code, out, err = run_cli(
+            ["headroom", "--limits-file", bad], cwd=tmp)
+        check("headroom CLI exit 2 on malformed limits file", code == 2,
+              "rc=%d err=%s" % (code, err[:120]))
 
     print("\n%d/%d passed" % (sum(PASS), len(PASS)))
     return 0 if all(PASS) else 1

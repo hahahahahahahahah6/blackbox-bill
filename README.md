@@ -32,14 +32,15 @@ Given a Cursor billing export CSV (columns vary — the parser is deliberately l
    - *"'fable-5.1' requests were routed to 'fable-5.5'"* — silent version swaps, with the N local sessions listed.
    - *"Unattended burn: $X spent while no interactive session was open"* — the "$40 while I slept" case.
    - *"Sudden pool switch on <date>"* — same usage pattern, different bucket mid-cycle.
-3. **Local-log cross-check** — joins bill rows against your `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/` by time window, reporting matched vs orphaned spend.
-4. **Plan-switch what-if simulator**:
+4. **Local-log cross-check** — joins bill rows against your `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/` by time window, reporting matched vs orphaned spend.
+5. **Plan-switch what-if simulator**:
 
 ```
 blackbox-bill --csv cursor-export.csv --whatif cursor:ultra
 ```
 
 re-prices observed token usage under a different plan's rates and prints the delta vs the actual bill. Bundled rate cards are **illustrative placeholders, not real Cursor pricing** — pass `--rates-file rates.json` with your own numbers (see `src/blackbox_bill/whatif.py` for the format).
+6. **Dispatch pre-flight headroom dashboard** (v0.3) — per-account rate-limit headroom *before* you dispatch, not after you're stuck mid task (see below).
 
 ```
 blackbox-bill --csv export.csv --markdown report.md --since 2026-09-01
@@ -72,6 +73,41 @@ blackbox-bill report --by-project --by-agent --tokenizer claude-4.7 \
     --rates-file my-rates.json --markdown attribution.md
 ```
 
+## Dispatch pre-flight headroom (v0.3)
+
+Everything above explains the bill *after the fact*. v0.3 adds the *pre-flight* view one Offrun Show HN user asked for verbatim: *"Thing I'd want surfaced is per account rate limit headroom before I dispatch, not after I'm stuck mid task."*
+
+Billing exports never carry quota limits, so you declare them once in a JSON file and blackbox-bill subtracts your observed usage — per account, per canonical pool — before the next dispatch:
+
+```bash
+blackbox-bill headroom --csv export.csv --limits-file limits.json
+```
+
+`limits.json`:
+
+```json
+{
+  "accounts": [
+    {"name": "cursor-pro", "plan": "cursor:pro",
+     "limits": {"cursor-models": 500.0, "other-models": 125.0, "api-key": null}},
+    {"name": "shared-api-key", "plan": "api-only",
+     "limits": {"api-key": 200.0},
+     "match": {"column": "account", "value": "shared-api-key"}}
+  ]
+}
+```
+
+Limits are USD caps per pool; `null` is unlimited. Rows are partitioned across accounts with the optional `match` spec (raw CSV column value); the single account without a `match` spec is the default for unclaimed rows. Pools are flagged `OK` / `LOW` (under 25% remaining) / `EXHAUSTED` / `UNLIMITED`.
+
+Planning to kick off a long agent run? Add `--task-in/--task-out` and the dispatch simulator re-prices the task under each account's plan rate card (the same cards the what-if simulator uses) and tells you which account can absorb it:
+
+```bash
+blackbox-bill headroom --csv export.csv --limits-file limits.json \
+    --task-in 1000000 --task-out 250000 --task-pool other-models
+```
+
+**Differentiation — from post-mortem to pre-flight.** v0.1–v0.2 were post-mortem: the bill arrived, the tool reconstructed *why it looks wrong*. v0.3 is pre-flight: the tool shows *remaining quota per account* and *which account survives the next dispatch* before you commit. The ledger positioning doesn't change — still read-only analysis, still no enforcement, no budget lines, no blocking (that's what agentcost-cli and resume-budget-guard are for). It's the same billing-attribution ledger, just turned one step earlier in time.
+
 ## Non-goals (what this is NOT)
 
 - **[agentcost-cli](https://dev.to/justinli2026/how-i-built-a-unified-cost-tracker-for-ai-coding-agents-claude-code-cursor-codex-1nid)** does multi-tool budget observability dashboards with WARN/OVERRUN budget lines. blackbox-bill has no dashboards, no budget lines, no MCP server — it explains one bill, once.
@@ -84,7 +120,9 @@ One sentence: the others tell you *how much* you spent or *stop* you from spendi
 
 Tools like [uppinote20/claude-dashboard](https://github.com/uppinote20/claude-dashboard) are **observability statuslines**: they live inside your IDE, rendering live context bars, rate-limit countdowns, and burn-rate widgets while you work. That's a telescope pointed at the present.
 
-blackbox-bill is a **billing-attribution ledger**: it runs after the fact, off local files only, and reconstructs *where the money went* — which pool, which project, which subagents, under which tokenizer's counting. No plugin install, no Node runtime, no live session needed — just the bill CSV and the transcripts you already have. Use the statusline to watch the burn; use blackbox-bill to audit it.
+blackbox-bill is a **billing-attribution ledger**: it runs off local files only, and reconstructs *where the money went* — which pool, which project, which subagents, under which tokenizer's counting. No plugin install, no Node runtime, no live session needed — just the bill CSV and the transcripts you already have. Use the statusline to watch the burn; use blackbox-bill to audit it.
+
+v0.3's headroom dashboard doesn't change that positioning: it is still the ledger, just consulted *before* the dispatch instead of after the bill. The "live" part of headroom is your own declared quota limits — the tool never polls a vendor API for remaining quota (no vendor puts that in an export, and polling one would need your credentials).
 
 ## Honest limitations
 
@@ -93,6 +131,8 @@ blackbox-bill is a **billing-attribution ledger**: it runs after the fact, off l
 - **Times are local-timezone best-effort.** Bill timestamps and local log timestamps are compared as wall-clock times on the same machine. If your export is in UTC and your logs are local, widen `--window-hours` or convert first.
 - **The join is evidence, not proof.** A bill row with no matching local session might be a background agent, a headless run, another machine, or a leaked key — the tool reports the gap; you investigate.
 - **Token-based re-pricing is approximate.** The what-if simulator re-prices tokens at flat rates; real plans have request-based pricing, overage rules, and weekly pools (e.g. SuperGrok bundles) that flat rates cannot model. Use `--rates-file` for your own numbers.
+- **Headroom limits are self-declared.** No billing export carries quota caps, so the dashboard subtracts observed spend from *your* numbers in `limits.json`. If your plan's cap changes and you don't update the file, the dashboard is wrong in exactly the way you'd expect. Keep limits conservative.
+- **Dispatch simulation prices, it doesn't predict.** It estimates a task's cost at flat per-token rates; real overage behavior, mid-task rate-limit backoff, and request-based floors aren't modeled. Treat "fits" as "has budget for this size", not a guarantee.
 
 ## Install
 
@@ -107,7 +147,7 @@ Zero dependencies — Python 3.9+ stdlib only.
 ## Example output
 
 ```
-blackbox-bill v0.2.0 — where the money went
+blackbox-bill v0.3.0 — where the money went
 ============================================================
 Bill rows: 5   requests: 68   billed total: $27.00
 
@@ -136,7 +176,7 @@ Evidence: 3 row(s), 60 request(s), $24.00.
 ## Development
 
 ```bash
-python3 tests/test_blackbox_bill.py          # 41 checks, <1s
+python3 tests/test_blackbox_bill.py          # 69 checks, <2s
 PYTHONPATH=src python3 -m unittest discover -s tests -t .   # 28 v2 checks
 ```
 
