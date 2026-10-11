@@ -32,6 +32,7 @@ def _empty_session(tool, session_id):
     return {
         "tool": tool,
         "session_id": session_id,
+        "project": "",
         "first_ts": None,
         "last_ts": None,
         "model": "",
@@ -39,6 +40,12 @@ def _empty_session(tool, session_id):
         "input_tokens": 0,
         "output_tokens": 0,
         "requests": 0,
+        # Subagent attribution: tokens measured on sidechain transcript
+        # messages; runs/type counted from Task tool_use blocks.
+        "subagent_input_tokens": 0,
+        "subagent_output_tokens": 0,
+        "subagent_runs": 0,
+        "subagent_types": Counter(),
     }
 
 
@@ -55,18 +62,61 @@ def _extract_usage(obj):
     return model, usage
 
 
-def _fold(s, model, usage, ts):
+def _fold(s, model, usage, ts, is_sidechain=False):
     if model:
         s["models"][model] += 1
+    tin = tout = 0
     if isinstance(usage, dict):
-        s["input_tokens"] += usage.get("input_tokens", 0) or 0
-        s["output_tokens"] += usage.get("output_tokens", 0) or 0
+        tin = usage.get("input_tokens", 0) or 0
+        tout = usage.get("output_tokens", 0) or 0
+    s["input_tokens"] += tin
+    s["output_tokens"] += tout
+    if is_sidechain:
+        # Sidechain messages are subagent work: their usage is counted in
+        # the session total AND attributed to subagents. (Subagent spawns
+        # are real API calls; the parent's ledger must not lose them.)
+        s["subagent_input_tokens"] += tin
+        s["subagent_output_tokens"] += tout
     s["requests"] += 1
     if ts:
         if s["first_ts"] is None or ts < s["first_ts"]:
             s["first_ts"] = ts
         if s["last_ts"] is None or ts > s["last_ts"]:
             s["last_ts"] = ts
+
+
+def _task_invocations(obj):
+    """Yield subagent_type values from Task tool_use blocks in a message.
+
+    Claude Code transcripts record subagent spawns as assistant messages
+    with a ``Task`` tool_use whose input carries ``subagent_type``. The
+    tokens for the run itself land on sidechain messages; this counts the
+    spawns and their declared types for the Top-N agent ranking.
+    """
+    if not isinstance(obj, dict):
+        return
+    msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_use" or block.get("name") != "Task":
+            continue
+        inp = block.get("input") or {}
+        stype = inp.get("subagent_type") if isinstance(inp, dict) else None
+        yield str(stype) if stype else "unknown"
+
+
+def _is_sidechain(obj):
+    """True when a transcript entry belongs to a subagent's sidechain."""
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("isSidechain"):
+        return True
+    msg = obj.get("message")
+    return bool(isinstance(msg, dict) and msg.get("isSidechain"))
 
 
 def _finalize(s):
@@ -79,8 +129,9 @@ def read_claude_logs(projects_dir=None):
     """Read ~/.claude/projects/**/*.jsonl into per-session summaries.
 
     Returns (sessions, warnings). Each session dict has tool='claude-code',
-    session_id, first_ts, last_ts, model (most common), input_tokens,
-    output_tokens, requests.
+    session_id, project (directory name under the projects dir), first_ts,
+    last_ts, model (most common), input_tokens, output_tokens, requests,
+    plus subagent attribution fields (see _empty_session).
     """
     base = projects_dir or os.path.expanduser("~/.claude/projects")
     sessions, warnings = [], []
@@ -92,6 +143,8 @@ def read_claude_logs(projects_dir=None):
     for path in sorted(files):
         session_id = os.path.splitext(os.path.basename(path))[0]
         s = _empty_session("claude-code", session_id)
+        rel = os.path.relpath(path, base)
+        s["project"] = rel.split(os.sep)[0] if rel else ""
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
@@ -103,7 +156,12 @@ def read_claude_logs(projects_dir=None):
                     except ValueError:
                         continue
                     model, usage = _extract_usage(obj)
-                    _fold(s, model, usage, _parse_ts(obj.get("timestamp")))
+                    sidechain = _is_sidechain(obj)
+                    _fold(s, model, usage, _parse_ts(obj.get("timestamp")),
+                          is_sidechain=sidechain)
+                    for stype in _task_invocations(obj):
+                        s["subagent_runs"] += 1
+                        s["subagent_types"][stype] += 1
         except OSError as exc:
             warnings.append("cannot read %s: %s" % (path, exc))
             continue
