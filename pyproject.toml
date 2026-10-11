@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blackbox-bill"
-version = "0.1.0"
-description = "Explain where your AI-coding-tool money went: Cursor billing black-box explainer"
+version = "0.2.0"
+description = "Explain where your AI-coding-tool money went: billing black-box explainer with tokenizer-aware per-project and subagent cost attribution"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "hao li" }]
